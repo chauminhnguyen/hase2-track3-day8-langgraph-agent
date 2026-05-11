@@ -12,36 +12,67 @@ from .state import AgentState, ApprovalDecision, Route, make_event
 def intake_node(state: AgentState) -> dict:
     """Normalize raw query into state fields.
 
-    TODO(student): add normalization, PII checks, and metadata extraction.
+    Performs query normalization, PII detection, and metadata extraction.
     """
+    import re
+
     query = state.get("query", "").strip()
+
+    # Simple PII redaction: mask email-like patterns and phone numbers
+    redacted = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[EMAIL]", query)
+    redacted = re.sub(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", "[PHONE]", redacted)
+
     return {
-        "query": query,
+        "query": redacted if redacted != query else query,
         "messages": [f"intake:{query[:40]}"],
-        "events": [make_event("intake", "completed", "query normalized")],
+        "events": [make_event("intake", "completed", "query normalized", pii_detected=redacted != query)],
     }
 
 
-def classify_node(state: AgentState) -> dict:
-    """Classify the query into a route.
+def _word_match(keyword: str, text: str) -> bool:
+    """Match keyword as a whole word in text, not as substring.
 
-    TODO(student): replace keyword heuristics with a clear routing policy.
-    Required routes: simple, tool, missing_info, risky, error.
+    Strips punctuation and checks word boundaries to avoid false matches
+    like 'it' matching inside 'item' or 'iteration'.
     """
-    query = state.get("query", "").lower()
-    words = query.split()
+    import re
+
+    return bool(re.search(rf"\b{re.escape(keyword)}\b", text))
+
+
+def classify_node(state: AgentState) -> dict:
+    """Classify the query into a route using keyword-based heuristics.
+
+    Priority order (highest first): risky → tool → missing_info → error → simple.
+    This prevents conflicts when a query contains keywords from multiple categories.
+    """
+    query = state.get("query", "").strip()
+    query_lower = query.lower()
+    words = query_lower.split()
     clean_words = [w.strip("?!.,;:") for w in words]
+
     route = Route.SIMPLE
     risk_level = "low"
-    if "refund" in query or "delete" in query or "send" in query:
+
+    # Priority 1: Risky — destructive or high-stakes actions
+    risky_keywords = ["refund", "delete", "send", "cancel", "remove", "revoke"]
+    if any(_word_match(kw, query_lower) for kw in risky_keywords):
         route = Route.RISKY
         risk_level = "high"
-    elif "status" in query or "order" in query or "lookup" in query:
+
+    # Priority 2: Tool — requires lookup or external data
+    elif any(_word_match(kw, query_lower) for kw in ["status", "order", "lookup", "check", "track", "find", "search"]):
         route = Route.TOOL
-    elif len(clean_words) < 5 and "it" in clean_words:
+
+    # Priority 3: Missing info — very short/vague queries with pronouns
+    elif len(clean_words) < 5 and any(w in clean_words for w in ["it", "that", "this", "thing"]):
         route = Route.MISSING_INFO
-    elif "timeout" in query or "fail" in query:
+
+    # Priority 4: Error — system failures and transient issues
+    elif any(_word_match(kw, query_lower) for kw in ["timeout", "fail", "failure", "error", "crash", "unavailable"]):
         route = Route.ERROR
+
+    # Priority 5: Simple — default fallback
     return {
         "route": route.value,
         "risk_level": risk_level,
@@ -52,9 +83,14 @@ def classify_node(state: AgentState) -> dict:
 def ask_clarification_node(state: AgentState) -> dict:
     """Ask for missing information instead of hallucinating.
 
-    TODO(student): generate a specific clarification question from state.
+    Generates a context-specific clarification question based on the query.
     """
-    question = "Can you provide the order id or the missing context?"
+    query = state.get("query", "")
+    question = (
+        f'Your request "{query[:60]}" lacks specific details. '
+        "Please provide more context such as an order ID, account reference, "
+        "or a clearer description of what you need help with."
+    )
     return {
         "pending_question": question,
         "final_answer": question,
@@ -82,11 +118,25 @@ def tool_node(state: AgentState) -> dict:
 def risky_action_node(state: AgentState) -> dict:
     """Prepare a risky action for approval.
 
-    TODO(student): create a proposed action with evidence and risk justification.
+    Creates a proposed action with risk justification based on query keywords.
     """
+    query = state.get("query", "")
+    query_lower = query.lower()
+
+    if "refund" in query_lower:
+        action_desc = "Process customer refund — financial impact, requires approval"
+    elif "delete" in query_lower:
+        action_desc = "Delete customer account — irreversible data loss, requires approval"
+    elif "cancel" in query_lower:
+        action_desc = "Cancel subscription/order — service impact, requires approval"
+    elif "send" in query_lower:
+        action_desc = "Send external communication — reputation risk, requires approval"
+    else:
+        action_desc = "High-risk operation — requires supervisory approval"
+
     return {
-        "proposed_action": "prepare refund or external action; approval required",
-        "events": [make_event("risky_action", "pending_approval", "approval required")],
+        "proposed_action": action_desc,
+        "events": [make_event("risky_action", "pending_approval", action_desc)],
     }
 
 
@@ -134,14 +184,22 @@ def retry_or_fallback_node(state: AgentState) -> dict:
 
 
 def answer_node(state: AgentState) -> dict:
-    """Produce a final response.
+    """Produce a final response grounded in tool_results and approval context."""
+    tool_results = state.get("tool_results", [])
+    approval = state.get("approval")
+    route = state.get("route", "")
 
-    TODO(student): ground the answer in tool_results and approval where relevant.
-    """
-    if state.get("tool_results"):
-        answer = f"I found: {state['tool_results'][-1]}"
+    if tool_results:
+        latest_result = tool_results[-1]
+        if approval and approval.get("approved"):
+            answer = f"Approved action completed. Result: {latest_result}"
+        else:
+            answer = f"I found: {latest_result}"
+    elif route == Route.SIMPLE.value:
+        answer = "Your request has been processed. For further assistance, please provide additional details."
     else:
-        answer = "This is a safe mock answer. Replace with your agent response."
+        answer = "Your request has been handled. Thank you for contacting support."
+
     return {
         "final_answer": answer,
         "events": [make_event("answer", "completed", "answer generated")],

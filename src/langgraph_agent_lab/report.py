@@ -8,10 +8,17 @@ from .metrics import MetricsReport
 
 
 def render_report_stub(metrics: MetricsReport) -> str:
-    """Return a minimal report stub.
+    """Return a detailed report with metrics table and analysis."""
+    rows = []
+    for s in metrics.scenario_metrics:
+        rows.append(
+            f"| {s.scenario_id} | {s.expected_route} | {s.actual_route or 'N/A'} "
+            f"| {'✅' if s.success else '❌'} | {s.retry_count} | {s.interrupt_count} |"
+        )
+    scenario_table = "\n".join(rows)
 
-    TODO(student): replace with a richer report using the template in reports/.
-    """
+    failed = [s for s in metrics.scenario_metrics if not s.success]
+
     return f"""# Day 08 Lab Report
 
 ## Metrics summary
@@ -22,9 +29,20 @@ def render_report_stub(metrics: MetricsReport) -> str:
 - Total retries: {metrics.total_retries}
 - Total interrupts: {metrics.total_interrupts}
 
-## TODO(student)
+## Scenario results
 
-Explain your architecture, state schema, failure modes, and improvement plan.
+| Scenario | Expected route | Actual route | Success | Retries | Interrupts |
+|---|---|---|---|---:|---:|
+{scenario_table}
+
+## Failure analysis
+
+{f'{len(failed)} scenario(s) failed:' if failed else 'All scenarios passed.'}
+{chr(10).join(f'- {s.scenario_id}: expected={s.expected_route}, actual={s.actual_route}, errors={s.errors}' for s in failed) if failed else ''}
+
+## Architecture
+
+See reports/lab_report.md for full details.
 """
 
 
